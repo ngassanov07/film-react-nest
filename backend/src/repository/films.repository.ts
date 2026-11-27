@@ -1,18 +1,21 @@
-import { Inject, Injectable } from '@nestjs/common';
-import { Connection, Model } from 'mongoose';
+import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { FilmDto, ScheduleDto } from '../films/dto/films.dto';
-import { DATABASE_CONNECTION } from './database.provider';
-import { FilmSchema } from './films.schema';
+import { Film } from '../films/entities/film.entity';
+import { Schedule } from '../films/entities/schedule.entity';
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 @Injectable()
 export class FilmsRepository {
-  private readonly films: Model<FilmDto>;
+  constructor(
+    @InjectRepository(Film) private readonly films: Repository<Film>,
+    private readonly dataSource: DataSource,
+  ) {}
 
-  constructor(@Inject(DATABASE_CONNECTION) connection: Connection) {
-    this.films = connection.model<FilmDto>('Film', FilmSchema, 'films');
-  }
-
-  private toScheduleDto(entity: ScheduleDto): ScheduleDto {
+  private toScheduleDto(entity: Schedule): ScheduleDto {
     return {
       id: entity.id,
       daytime: entity.daytime,
@@ -20,16 +23,16 @@ export class FilmsRepository {
       rows: entity.rows,
       seats: entity.seats,
       price: entity.price,
-      taken: [...(entity.taken ?? [])],
+      taken: [...entity.taken],
     };
   }
 
-  private toFilmDto(entity: FilmDto): FilmDto {
+  private toFilmDto(entity: Film): FilmDto {
     return {
       id: entity.id,
       rating: entity.rating,
       director: entity.director,
-      tags: [...(entity.tags ?? [])],
+      tags: [...entity.tags],
       title: entity.title,
       about: entity.about,
       description: entity.description,
@@ -40,12 +43,19 @@ export class FilmsRepository {
   }
 
   async findAll(): Promise<FilmDto[]> {
-    const films = await this.films.find().lean<FilmDto[]>().exec();
+    const films = await this.films.find();
     return films.map((film) => this.toFilmDto(film));
   }
 
   async findById(id: string): Promise<FilmDto | null> {
-    const film = await this.films.findOne({ id }).lean<FilmDto>().exec();
+    if (!UUID_PATTERN.test(id)) {
+      return null;
+    }
+    const film = await this.films.findOne({
+      where: { id },
+      relations: { schedule: true },
+      order: { schedule: { daytime: 'ASC' } },
+    });
     return film ? this.toFilmDto(film) : null;
   }
 
@@ -54,15 +64,17 @@ export class FilmsRepository {
     sessionId: string,
     seats: string[],
   ): Promise<boolean> {
-    const result = await this.films
-      .updateOne(
-        {
-          id: filmId,
-          schedule: { $elemMatch: { id: sessionId, taken: { $nin: seats } } },
-        },
-        { $push: { 'schedule.$.taken': { $each: seats } } },
-      )
-      .exec();
-    return result.modifiedCount === 1;
+    return this.dataSource.transaction(async (manager) => {
+      const session = await manager.findOne(Schedule, {
+        where: { id: sessionId, film: { id: filmId } },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!session || seats.some((seat) => session.taken.includes(seat))) {
+        return false;
+      }
+      session.taken = [...session.taken, ...seats];
+      await manager.save(session);
+      return true;
+    });
   }
 }
